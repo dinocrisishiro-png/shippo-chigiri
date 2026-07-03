@@ -1,7 +1,7 @@
 # ググガガ しっぽちぎり
 
 ペンギン「ググガガ」のしっぽをちぎる 60 秒スコアアタックゲーム。
-単一の `index.html`（Vanilla JS / Canvas、外部ライブラリなし）で動きます。
+`index.html`（Vanilla JS / Canvas、外部ライブラリなし）と `assets/` のスプライト PNG で動きます。
 
 ## 遊び方
 
@@ -26,7 +26,19 @@
 
 `index.html` をブラウザで開くだけ。ビルド不要。
 
-## v0.1
+## スプライト描画
+
+- `assets/gugugaga_idle.png`（のんびり）/ `assets/gugugaga_alert.png`（警戒・逃走・捕獲）/ `assets/tail.png` を `drawImage` で描画
+- しっぽの掴み判定アンカーは画像内の相対座標（`SPRITE_DEFS.tail.grab`）で定義
+- 画像のロードに失敗した場合は従来の図形描画に自動フォールバック
+
+## 更新履歴
+
+### v0.2
+
+- 描画をスプライト方式（透過 PNG + drawImage）に差し替え、図形描画はフォールバックに
+
+### v0.1
 
 - ステートマシン（のんびり → 警戒 → 逃走 → 捕獲）
 - Pointer Events によるマウス / タッチ統一操作

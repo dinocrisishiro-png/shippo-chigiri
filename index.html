@@ -84,6 +84,35 @@ const BEST_KEY = "shippo-chigiri-best";
 const GAME_TIME = 60;
 const TAIL_REGROW_SEC = 4;
 
+// ---------- sprites ----------
+// アンカーは画像内の相対座標(0..1)で定義する
+const SPRITE_DEFS = {
+  idle:  { src: "assets/gugugaga_idle.png" },
+  alert: { src: "assets/gugugaga_alert.png" },
+  tail:  {
+    src: "assets/tail.png",
+    attach: { x: 0.88, y: 0.5 }, // 体との接続点
+    grab:   { x: 0.18, y: 0.5 }, // 掴み判定アンカー(先端)
+  },
+};
+const BODY_DRAW_SIZE = 140; // 体スプライトの描画サイズ(px)
+const TAIL_DRAW_W = 52;
+const TAIL_DRAW_H = 39;
+
+const sprites = {};
+let spritesReady = false; // 1枚でもロード失敗したらfalseのまま→図形描画にフォールバック
+{
+  let pending = Object.keys(SPRITE_DEFS).length;
+  let failed = false;
+  for (const [key, def] of Object.entries(SPRITE_DEFS)) {
+    const img = new Image();
+    img.onload = () => { if (--pending === 0 && !failed) spritesReady = true; };
+    img.onerror = () => { failed = true; console.warn(`sprite load failed: ${def.src} — 図形描画にフォールバック`); };
+    img.src = def.src;
+    sprites[key] = img;
+  }
+}
+
 // penguin state machine
 const S = { NONBIRI: "nonbiri", KEIKAI: "keikai", TOSO: "toso", HOKAKU: "hokaku" };
 
@@ -130,8 +159,30 @@ const rand = (a, b) => a + Math.random() * (b - a);
 const dist = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
+function tailTransform() {
+  // しっぽ付け根のワールド座標と回転。tail.pngは左向き(先端が-x側)なので
+  // facing方向にそのまま回転させると先端が後ろへ突き出る
+  const wig = Math.sin(penguin.waddle * 1.5) * 0.25;
+  return {
+    x: penguin.x - Math.cos(penguin.angle) * (penguin.r - 6),
+    y: penguin.y - Math.sin(penguin.angle) * (penguin.r - 6),
+    rot: penguin.angle + wig,
+  };
+}
+
 function tailPos() {
-  // tail sticks out behind the penguin
+  if (spritesReady) {
+    // 画像内の相対座標アンカー(grab)をワールド座標へ変換
+    const def = SPRITE_DEFS.tail;
+    const t = tailTransform();
+    const lx = (def.grab.x - def.attach.x) * TAIL_DRAW_W;
+    const ly = (def.grab.y - def.attach.y) * TAIL_DRAW_H;
+    return {
+      x: t.x + Math.cos(t.rot) * lx - Math.sin(t.rot) * ly,
+      y: t.y + Math.sin(t.rot) * lx + Math.cos(t.rot) * ly,
+    };
+  }
+  // フォールバック(図形描画)時: 体の後方に固定オフセット
   return {
     x: penguin.x - Math.cos(penguin.angle) * (penguin.r + 14),
     y: penguin.y - Math.sin(penguin.angle) * (penguin.r + 14),
@@ -387,17 +438,63 @@ function drawBackground() {
 }
 
 function drawPenguin() {
-  const { x, y, angle } = penguin;
   const bob = penguin.speed > 1 ? Math.sin(penguin.waddle) * 2.5 : 0;
-
-  ctx.save();
-  ctx.translate(x, y + bob);
 
   // shadow
   ctx.fillStyle = "rgba(0,0,0,0.3)";
   ctx.beginPath();
-  ctx.ellipse(0, penguin.r + 8 - bob, penguin.r * 0.9, 8, 0, 0, Math.PI * 2);
+  ctx.ellipse(penguin.x, penguin.y + penguin.r + 8, penguin.r * 0.9, 8, 0, 0, Math.PI * 2);
   ctx.fill();
+
+  if (spritesReady) drawPenguinSprite(bob);
+  else drawPenguinShapes(bob);
+
+  drawPenguinOverlays(bob);
+}
+
+function drawTailSprite(tt, bob, scale) {
+  const def = SPRITE_DEFS.tail;
+  const w = TAIL_DRAW_W * scale;
+  const h = TAIL_DRAW_H * scale;
+  ctx.save();
+  ctx.translate(tt.x, tt.y + bob);
+  ctx.rotate(tt.rot);
+  ctx.drawImage(sprites.tail, -def.attach.x * w, -def.attach.y * h, w, h);
+  ctx.restore();
+}
+
+function drawPenguinSprite(bob) {
+  // しっぽ(再生中は途中サイズ)を体より先に描く
+  const tt = tailTransform();
+  if (penguin.hasTail) {
+    drawTailSprite(tt, bob, 1);
+    if (grab.active) {
+      const g = tailPos();
+      ctx.fillStyle = "rgba(255, 180, 94, 0.35)";
+      ctx.beginPath();
+      ctx.arc(g.x, g.y + bob, 20, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else {
+    const p = 1 - penguin.tailRegrow / TAIL_REGROW_SEC;
+    if (p > 0.05) drawTailSprite(tt, bob, p);
+  }
+
+  // ステートでスプライト切替: のんびり=idle / 警戒・逃走・捕獲=alert
+  const img = penguin.state === S.NONBIRI ? sprites.idle : sprites.alert;
+  ctx.save();
+  ctx.translate(penguin.x, penguin.y + bob);
+  ctx.rotate(penguin.angle);
+  if (Math.cos(penguin.angle) < 0) ctx.scale(1, -1); // 左向きで上下逆さまにならないように
+  ctx.drawImage(img, -BODY_DRAW_SIZE / 2, -BODY_DRAW_SIZE / 2, BODY_DRAW_SIZE, BODY_DRAW_SIZE);
+  ctx.restore();
+}
+
+function drawPenguinShapes(bob) {
+  const { x, y, angle } = penguin;
+
+  ctx.save();
+  ctx.translate(x, y + bob);
 
   // tail (behind body)
   if (penguin.hasTail) {
@@ -488,6 +585,10 @@ function drawPenguin() {
   ctx.fill();
 
   ctx.restore();
+}
+
+function drawPenguinOverlays(bob) {
+  const { x, y } = penguin;
 
   // "!" alert mark
   if (penguin.state === S.KEIKAI) {

@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>ググガガ しっぽちぎり</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #0b1d2a; font-family: "Hiragino Maru Gothic ProN", "Yu Gothic", sans-serif; }
+  #game { display: block; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+  .overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 16px;
+    background: rgba(5, 15, 25, 0.82); color: #eaf6ff; text-align: center; z-index: 10;
+  }
+  .overlay h1 { font-size: clamp(28px, 6vw, 52px); letter-spacing: 0.08em; }
+  .overlay p { font-size: clamp(14px, 2.5vw, 18px); line-height: 1.9; opacity: 0.9; padding: 0 20px; }
+  .overlay .score-big { font-size: clamp(40px, 9vw, 80px); font-weight: bold; color: #ffd76a; }
+  .overlay button {
+    font-family: inherit; font-size: clamp(18px, 3vw, 24px); font-weight: bold;
+    padding: 14px 48px; border: none; border-radius: 999px; cursor: pointer;
+    background: #ffd76a; color: #4a2f00; box-shadow: 0 4px 0 #b8933a;
+  }
+  .overlay button:active { transform: translateY(3px); box-shadow: 0 1px 0 #b8933a; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="startOverlay" class="overlay">
+  <h1>ググガガ しっぽちぎり</h1>
+  <p>
+    ペンギンの「ググガガ」にそーっと近づいて、しっぽを掴もう。<br>
+    速く近づくと気づかれて逃げられるぞ！<br>
+    掴んだら<strong>逃げる方向と逆</strong>にドラッグして張力ゲージをためて…ちぎり！<br>
+    しっぽは数秒で再生する。60秒でハイスコアを目指せ！
+  </p>
+  <button id="startBtn">スタート</button>
+  <p id="bestLabel"></p>
+</div>
+
+<div id="endOverlay" class="overlay hidden">
+  <h1>タイムアップ！</h1>
+  <div class="score-big" id="finalScore">0</div>
+  <p id="endBest"></p>
+  <button id="retryBtn">もういちど</button>
+</div>
+
+<script>
+"use strict";
+
+// ---------- setup ----------
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener("resize", resize);
+resize();
+
+const BEST_KEY = "shippo-chigiri-best";
+const GAME_TIME = 60;
+const TAIL_REGROW_SEC = 4;
+
+// penguin state machine
+const S = { NONBIRI: "nonbiri", KEIKAI: "keikai", TOSO: "toso", HOKAKU: "hokaku" };
+
+const game = {
+  running: false,
+  time: GAME_TIME,
+  score: 0,
+  combo: 0,
+  best: Number(localStorage.getItem(BEST_KEY) || 0),
+};
+
+const penguin = {
+  x: 0, y: 0,
+  angle: 0,          // facing direction
+  speed: 0,
+  state: S.NONBIRI,
+  stateTimer: 0,
+  targetX: 0, targetY: 0,
+  hasTail: true,
+  tailRegrow: 0,
+  waddle: 0,
+  r: 26,             // body radius
+};
+
+const pointer = {
+  x: -999, y: -999,
+  px: -999, py: -999,
+  vx: 0, vy: 0,
+  speed: 0,
+  down: false,
+  id: null,
+};
+
+const grab = {
+  active: false,
+  tension: 0,        // 0..1
+};
+
+let particles = [];
+let popups = [];     // floating texts
+
+// ---------- helpers ----------
+const rand = (a, b) => a + Math.random() * (b - a);
+const dist = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+function tailPos() {
+  // tail sticks out behind the penguin
+  return {
+    x: penguin.x - Math.cos(penguin.angle) * (penguin.r + 14),
+    y: penguin.y - Math.sin(penguin.angle) * (penguin.r + 14),
+  };
+}
+
+function pickWanderTarget() {
+  const m = 70;
+  penguin.targetX = rand(m, W - m);
+  penguin.targetY = rand(m, H - m);
+}
+
+function setState(s, t = 0) {
+  penguin.state = s;
+  penguin.stateTimer = t;
+}
+
+function resetPenguin() {
+  penguin.x = W / 2;
+  penguin.y = H / 2;
+  penguin.hasTail = true;
+  penguin.tailRegrow = 0;
+  setState(S.NONBIRI);
+  pickWanderTarget();
+}
+
+// ---------- pointer events (mouse / touch unified) ----------
+canvas.addEventListener("pointerdown", (e) => {
+  if (!game.running) return;
+  if (pointer.id !== null) return;
+  pointer.id = e.pointerId;
+  canvas.setPointerCapture(e.pointerId);
+  pointer.down = true;
+  pointer.x = pointer.px = e.clientX;
+  pointer.y = pointer.py = e.clientY;
+
+  // try to grab the tail
+  if (penguin.hasTail && penguin.state !== S.HOKAKU) {
+    const t = tailPos();
+    if (dist(e.clientX, e.clientY, t.x, t.y) < 42) {
+      grab.active = true;
+      grab.tension = 0;
+      setState(S.HOKAKU);
+      popup(t.x, t.y - 30, "つかんだ！", "#8fd4ff");
+    }
+  }
+});
+
+canvas.addEventListener("pointermove", (e) => {
+  if (pointer.id !== null && e.pointerId !== pointer.id) return;
+  pointer.x = e.clientX;
+  pointer.y = e.clientY;
+});
+
+function releasePointer(e) {
+  if (e.pointerId !== pointer.id) return;
+  pointer.id = null;
+  pointer.down = false;
+  if (grab.active) {
+    // let go before tearing -> penguin escapes
+    grab.active = false;
+    grab.tension = 0;
+    game.combo = 0;
+    popup(penguin.x, penguin.y - 50, "にげられた…", "#aab6c2");
+    setState(S.TOSO, 1.2);
+  }
+}
+canvas.addEventListener("pointerup", releasePointer);
+canvas.addEventListener("pointercancel", releasePointer);
+
+// ---------- effects ----------
+function popup(x, y, text, color) {
+  popups.push({ x, y, text, color, life: 1 });
+}
+
+function burst(x, y) {
+  for (let i = 0; i < 26; i++) {
+    const a = rand(0, Math.PI * 2);
+    const sp = rand(60, 320);
+    particles.push({
+      x, y,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp,
+      life: rand(0.5, 1),
+      color: Math.random() < 0.5 ? "#ffd76a" : "#ffffff",
+      r: rand(2, 5),
+    });
+  }
+}
+
+// ---------- tear! ----------
+function tear() {
+  const t = tailPos();
+  penguin.hasTail = false;
+  penguin.tailRegrow = TAIL_REGROW_SEC;
+  grab.active = false;
+  grab.tension = 0;
+  game.combo++;
+  const pts = 100 * game.combo;
+  game.score += pts;
+  burst(t.x, t.y);
+  popup(t.x, t.y - 20, "ちぎり！", "#ff6a8a");
+  popup(t.x, t.y - 56, `+${pts}` + (game.combo > 1 ? ` (x${game.combo})` : ""), "#ffd76a");
+  setState(S.TOSO, 1.6);
+}
+
+// ---------- update ----------
+function updatePointer(dt) {
+  if (dt > 0) {
+    pointer.vx = (pointer.x - pointer.px) / dt;
+    pointer.vy = (pointer.y - pointer.py) / dt;
+    pointer.speed = Math.hypot(pointer.vx, pointer.vy);
+  }
+  pointer.px = pointer.x;
+  pointer.py = pointer.y;
+}
+
+function updatePenguin(dt) {
+  penguin.stateTimer -= dt;
+  penguin.waddle += dt * 10;
+
+  // tail regrowth
+  if (!penguin.hasTail) {
+    penguin.tailRegrow -= dt;
+    if (penguin.tailRegrow <= 0) {
+      penguin.hasTail = true;
+      const t = tailPos();
+      popup(t.x, t.y - 24, "しっぽ再生！", "#8fffb0");
+    }
+  }
+
+  const dToPointer = dist(penguin.x, penguin.y, pointer.x, pointer.y);
+
+  switch (penguin.state) {
+    case S.NONBIRI: {
+      // waddle toward wander target
+      const d = dist(penguin.x, penguin.y, penguin.targetX, penguin.targetY);
+      if (d < 20) pickWanderTarget();
+      const a = Math.atan2(penguin.targetY - penguin.y, penguin.targetX - penguin.x);
+      penguin.angle += Math.atan2(Math.sin(a - penguin.angle), Math.cos(a - penguin.angle)) * dt * 3;
+      penguin.speed = 45;
+      // notice a fast-approaching pointer
+      if (dToPointer < 160 && pointer.speed > 350) {
+        setState(S.KEIKAI, 0.45);
+        penguin.speed = 0;
+      }
+      break;
+    }
+    case S.KEIKAI: {
+      // freeze with "!" then flee
+      penguin.speed = 0;
+      if (penguin.stateTimer <= 0) setState(S.TOSO, 1.5);
+      break;
+    }
+    case S.TOSO: {
+      // run away from the pointer
+      const a = Math.atan2(penguin.y - pointer.y, penguin.x - pointer.x);
+      penguin.angle += Math.atan2(Math.sin(a - penguin.angle), Math.cos(a - penguin.angle)) * dt * 8;
+      penguin.speed = 240;
+      // keep fleeing while the pointer stays close
+      if (dToPointer < 200) penguin.stateTimer = Math.max(penguin.stateTimer, 0.5);
+      if (penguin.stateTimer <= 0) {
+        setState(S.NONBIRI);
+        pickWanderTarget();
+      }
+      break;
+    }
+    case S.HOKAKU: {
+      // caught by the tail: struggles away from the pointer
+      const fleeA = Math.atan2(penguin.y - pointer.y, penguin.x - pointer.x);
+      penguin.angle = fleeA;
+      penguin.speed = 30;
+      penguin.x += Math.cos(fleeA + Math.sin(penguin.waddle * 3) * 0.6) * 40 * dt;
+
+      // tension: drag opposite to the flee direction
+      const t = tailPos();
+      const pullX = pointer.x - t.x;
+      const pullY = pointer.y - t.y;
+      const pullLen = Math.hypot(pullX, pullY);
+      if (pullLen > 8) {
+        // alignment: 1 when pulling exactly opposite to flee direction
+        const align = -(Math.cos(fleeA) * pullX + Math.sin(fleeA) * pullY) / pullLen;
+        if (align > 0.3) {
+          grab.tension += align * clamp(pullLen / 90, 0, 1.6) * dt * 0.9;
+        }
+      }
+      grab.tension -= dt * 0.25; // constant decay
+      grab.tension = clamp(grab.tension, 0, 1);
+      if (grab.tension >= 1) tear();
+
+      // dragged too far -> slips out of your hand
+      if (pullLen > 220) {
+        grab.active = false;
+        grab.tension = 0;
+        game.combo = 0;
+        popup(t.x, t.y - 30, "すっぽ抜けた！", "#aab6c2");
+        setState(S.TOSO, 1.2);
+      }
+      break;
+    }
+  }
+
+  // move
+  if (penguin.state !== S.HOKAKU) {
+    penguin.x += Math.cos(penguin.angle) * penguin.speed * dt;
+    penguin.y += Math.sin(penguin.angle) * penguin.speed * dt;
+  }
+
+  // stay on screen
+  const m = 40;
+  if (penguin.x < m || penguin.x > W - m || penguin.y < m || penguin.y > H - m) {
+    penguin.x = clamp(penguin.x, m, W - m);
+    penguin.y = clamp(penguin.y, m, H - m);
+    if (penguin.state === S.TOSO) {
+      // bounce along the wall
+      penguin.angle = Math.atan2(H / 2 - penguin.y, W / 2 - penguin.x) + rand(-0.8, 0.8);
+    } else if (penguin.state === S.NONBIRI) {
+      pickWanderTarget();
+    }
+  }
+}
+
+function updateEffects(dt) {
+  particles = particles.filter((p) => {
+    p.life -= dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 400 * dt;
+    return p.life > 0;
+  });
+  popups = popups.filter((p) => {
+    p.life -= dt * 0.8;
+    p.y -= 40 * dt;
+    return p.life > 0;
+  });
+}
+
+// ---------- draw ----------
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#12324a");
+  g.addColorStop(1, "#0b1d2a");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // ice floor
+  ctx.fillStyle = "rgba(210, 235, 255, 0.07)";
+  for (let i = 0; i < 5; i++) {
+    const y = (H / 5) * i + 40;
+    ctx.beginPath();
+    ctx.ellipse(W * ((i * 0.37) % 1), y, 120, 26, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function drawPenguin() {
+  const { x, y, angle } = penguin;
+  const bob = penguin.speed > 1 ? Math.sin(penguin.waddle) * 2.5 : 0;
+
+  ctx.save();
+  ctx.translate(x, y + bob);
+
+  // shadow
+  ctx.fillStyle = "rgba(0,0,0,0.3)";
+  ctx.beginPath();
+  ctx.ellipse(0, penguin.r + 8 - bob, penguin.r * 0.9, 8, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // tail (behind body)
+  if (penguin.hasTail) {
+    const ta = angle + Math.PI;
+    const wig = Math.sin(penguin.waddle * 1.5) * 0.25;
+    ctx.save();
+    ctx.rotate(ta + wig);
+    ctx.fillStyle = grab.active ? "#ffb45e" : "#2c3e50";
+    ctx.beginPath();
+    ctx.moveTo(penguin.r - 6, 0);
+    ctx.lineTo(penguin.r + 20, -9);
+    ctx.lineTo(penguin.r + 20, 9);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  } else {
+    // regrowing stub
+    const p = 1 - penguin.tailRegrow / TAIL_REGROW_SEC;
+    ctx.save();
+    ctx.rotate(angle + Math.PI);
+    ctx.fillStyle = "#44586c";
+    ctx.beginPath();
+    ctx.moveTo(penguin.r - 6, 0);
+    ctx.lineTo(penguin.r - 6 + 26 * p, -9 * p);
+    ctx.lineTo(penguin.r - 6 + 26 * p, 9 * p);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // body
+  ctx.fillStyle = "#2c3e50";
+  ctx.beginPath();
+  ctx.ellipse(0, 0, penguin.r * 0.85, penguin.r, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // belly
+  ctx.fillStyle = "#f4f9fd";
+  ctx.beginPath();
+  ctx.ellipse(Math.cos(angle) * 7, Math.sin(angle) * 7 + 4, penguin.r * 0.55, penguin.r * 0.68, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // flippers
+  const flap = penguin.state === S.HOKAKU ? Math.sin(penguin.waddle * 4) * 0.7 : Math.sin(penguin.waddle) * 0.15;
+  ctx.fillStyle = "#22303e";
+  for (const side of [-1, 1]) {
+    ctx.save();
+    ctx.rotate(angle + side * (Math.PI / 2 + flap * side));
+    ctx.beginPath();
+    ctx.ellipse(penguin.r * 0.55, 0, 7, 16, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // head
+  const hx = Math.cos(angle) * penguin.r * 0.72;
+  const hy = Math.sin(angle) * penguin.r * 0.72 - 14;
+  ctx.fillStyle = "#2c3e50";
+  ctx.beginPath();
+  ctx.arc(hx, hy, 14, 0, Math.PI * 2);
+  ctx.fill();
+
+  // beak
+  ctx.fillStyle = "#f5a623";
+  ctx.save();
+  ctx.translate(hx, hy);
+  ctx.rotate(angle);
+  ctx.beginPath();
+  ctx.moveTo(10, -4);
+  ctx.lineTo(22, 0);
+  ctx.lineTo(10, 4);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  // eyes
+  ctx.fillStyle = "#fff";
+  const ex = Math.cos(angle + 0.5) * 9, ey = Math.sin(angle + 0.5) * 9;
+  const ex2 = Math.cos(angle - 0.5) * 9, ey2 = Math.sin(angle - 0.5) * 9;
+  ctx.beginPath();
+  ctx.arc(hx + ex, hy + ey, 4, 0, Math.PI * 2);
+  ctx.arc(hx + ex2, hy + ey2, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#111";
+  ctx.beginPath();
+  ctx.arc(hx + ex, hy + ey, 2, 0, Math.PI * 2);
+  ctx.arc(hx + ex2, hy + ey2, 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.restore();
+
+  // "!" alert mark
+  if (penguin.state === S.KEIKAI) {
+    ctx.fillStyle = "#ffd76a";
+    ctx.font = "bold 34px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("！", x, y - penguin.r - 24 + bob);
+  }
+
+  // tension gauge while grabbing
+  if (grab.active) {
+    const t = tailPos();
+    const gw = 70, gh = 10;
+    const gx = t.x - gw / 2, gy = t.y + 26;
+    ctx.fillStyle = "rgba(0,0,0,0.5)";
+    ctx.fillRect(gx - 2, gy - 2, gw + 4, gh + 4);
+    ctx.fillStyle = grab.tension > 0.75 ? "#ff6a8a" : "#ffd76a";
+    ctx.fillRect(gx, gy, gw * grab.tension, gh);
+    // hint arrow: pull opposite to flee direction
+    const fleeA = penguin.angle;
+    ctx.save();
+    ctx.translate(t.x, t.y);
+    ctx.rotate(fleeA + Math.PI);
+    ctx.strokeStyle = "rgba(255, 215, 106, 0.7)";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(24, 0); ctx.lineTo(52, 0);
+    ctx.moveTo(44, -7); ctx.lineTo(52, 0); ctx.lineTo(44, 7);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawEffects() {
+  for (const p of particles) {
+    ctx.globalAlpha = clamp(p.life, 0, 1);
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  for (const p of popups) {
+    ctx.globalAlpha = clamp(p.life, 0, 1);
+    ctx.fillStyle = p.color;
+    ctx.font = "bold 26px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(p.text, p.x, p.y);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+  ctx.fillStyle = "#eaf6ff";
+  ctx.font = "bold 22px sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText(`スコア: ${game.score}`, 16, 34);
+  ctx.textAlign = "right";
+  const t = Math.ceil(game.time);
+  ctx.fillStyle = t <= 10 ? "#ff6a8a" : "#eaf6ff";
+  ctx.fillText(`のこり ${t} 秒`, W - 16, 34);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "rgba(234,246,255,0.6)";
+  ctx.font = "14px sans-serif";
+  ctx.fillText(`ベスト: ${game.best}`, W / 2, 30);
+}
+
+// ---------- game flow ----------
+const startOverlay = document.getElementById("startOverlay");
+const endOverlay = document.getElementById("endOverlay");
+
+function startGame() {
+  game.running = true;
+  game.time = GAME_TIME;
+  game.score = 0;
+  game.combo = 0;
+  grab.active = false;
+  grab.tension = 0;
+  particles = [];
+  popups = [];
+  resetPenguin();
+  startOverlay.classList.add("hidden");
+  endOverlay.classList.add("hidden");
+}
+
+function endGame() {
+  game.running = false;
+  grab.active = false;
+  pointer.down = false;
+  pointer.id = null;
+  if (game.score > game.best) {
+    game.best = game.score;
+    localStorage.setItem(BEST_KEY, String(game.best));
+  }
+  document.getElementById("finalScore").textContent = game.score;
+  document.getElementById("endBest").textContent = `ベストスコア: ${game.best}`;
+  endOverlay.classList.remove("hidden");
+}
+
+document.getElementById("startBtn").addEventListener("click", startGame);
+document.getElementById("retryBtn").addEventListener("click", startGame);
+document.getElementById("bestLabel").textContent =
+  game.best > 0 ? `ベストスコア: ${game.best}` : "";
+
+// ---------- main loop ----------
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+
+  if (game.running) {
+    game.time -= dt;
+    if (game.time <= 0) {
+      game.time = 0;
+      endGame();
+    }
+    updatePointer(dt);
+    updatePenguin(dt);
+  }
+  updateEffects(dt);
+
+  drawBackground();
+  drawPenguin();
+  drawEffects();
+  if (game.running) drawHUD();
+
+  requestAnimationFrame(loop);
+}
+resetPenguin();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

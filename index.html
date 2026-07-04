@@ -47,10 +47,18 @@
   }
   .overlay button:active { transform: translateY(3px); box-shadow: 0 1px 0 #b8933a; }
   .hidden { display: none !important; }
+  #muteBtn {
+    position: fixed; right: 12px; bottom: 12px; z-index: 20;
+    width: 44px; height: 44px; padding: 0; border: none; border-radius: 50%;
+    background: rgba(255, 215, 106, 0.92); color: #4a2f00; font-size: 20px;
+    line-height: 44px; text-align: center; cursor: pointer; box-shadow: 0 3px 0 #b8933a;
+  }
+  #muteBtn:active { transform: translateY(2px); box-shadow: 0 1px 0 #b8933a; }
 </style>
 </head>
 <body>
 <canvas id="game"></canvas>
+<button id="muteBtn" type="button" aria-label="サウンドのオン/オフ">🔊</button>
 
 <div id="startOverlay" class="overlay">
   <h1>ググガガ しっぽちぎり</h1>
@@ -93,7 +101,7 @@ resize();
 
 const BEST_KEY = "shippo-chigiri-best";
 const GAME_TIME = 60;
-const MAX_PENGUINS = 3;
+const MAX_PENGUINS = 5;
 const SPAWN_MIN = 2, SPAWN_MAX = 5; // スポーン間隔(秒)
 const BLINK_WARN_SEC = 1.5;         // 消滅前の点滅警告
 const FADE_SEC = 0.5;               // 時間切れフェードアウト
@@ -988,6 +996,142 @@ function drawHUD() {
 const startOverlay = document.getElementById("startOverlay");
 const endOverlay = document.getElementById("endOverlay");
 
+// ---------- audio（Web Audioで自前生成。外部ファイル不要でオフライン動作） ----------
+const AUDIO_KEY = "shippo-chigiri-sound";
+const audio = {
+  ctx: null, master: null, musicGain: null, sfxGain: null,
+  enabled: localStorage.getItem(AUDIO_KEY) !== "off",
+  musicTimer: null,
+};
+
+function initAudio() {
+  if (audio.ctx) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  audio.ctx = new AC();
+  audio.master = audio.ctx.createGain();
+  audio.master.gain.value = audio.enabled ? 1 : 0;
+  audio.master.connect(audio.ctx.destination);
+  audio.musicGain = audio.ctx.createGain();
+  audio.musicGain.gain.value = 0.32;
+  audio.musicGain.connect(audio.master);
+  audio.sfxGain = audio.ctx.createGain();
+  audio.sfxGain.gain.value = 0.5;
+  audio.sfxGain.connect(audio.master);
+}
+function resumeAudio() {
+  if (!audio.ctx) initAudio();
+  if (audio.ctx && audio.ctx.state === "suspended") audio.ctx.resume();
+}
+const midiFreq = (n) => 440 * Math.pow(2, (n - 69) / 12);
+
+// BGM: ゆるくてかわいいペンタトニックのループ（16ステップ=8分音符）
+const MUSIC = {
+  bpm: 116,
+  melody: [76, null, 79, 81, 76, null, 74, 72, 69, null, 72, 74, 76, 79, 74, 72], // Aマイナー系
+  bass:   [45, 40, 41, 40], // A2 / E2 / F2 / E2 相当（4ステップごと）
+};
+let musicStep = 0, musicNextTime = 0;
+
+function playTone(freq, when, dur, type, peak, target) {
+  const o = audio.ctx.createOscillator();
+  const g = audio.ctx.createGain();
+  o.type = type;
+  o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(peak, when + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+  o.connect(g); g.connect(target);
+  o.start(when); o.stop(when + dur + 0.05);
+}
+function scheduleMusic() {
+  if (!audio.ctx) return;
+  const stepDur = 60 / MUSIC.bpm / 2;
+  while (musicNextTime < audio.ctx.currentTime + 0.25) {
+    const s = musicStep % 16;
+    const m = MUSIC.melody[s];
+    if (m !== null) playTone(midiFreq(m), musicNextTime, stepDur * 0.9, "triangle", 0.22, audio.musicGain);
+    if (s % 2 === 0) playTone(midiFreq(MUSIC.bass[Math.floor(s / 4)]), musicNextTime, stepDur * 1.7, "sine", 0.28, audio.musicGain);
+    if (s % 4 === 0) playTone(70, musicNextTime, 0.12, "sine", 0.5, audio.musicGain); // やわらかいキック
+    musicNextTime += stepDur;
+    musicStep++;
+  }
+}
+function startMusic() {
+  if (!audio.ctx || audio.musicTimer) return;
+  musicStep = 0;
+  musicNextTime = audio.ctx.currentTime + 0.1;
+  audio.musicTimer = setInterval(scheduleMusic, 60);
+}
+function stopMusic() {
+  if (audio.musicTimer) { clearInterval(audio.musicTimer); audio.musicTimer = null; }
+}
+
+// 引っ張られたときの「ぐーぐーガーガー」悲鳴（母音フォルマント合成）
+const VOWEL_GU = [320, 720], VOWEL_GA = [780, 1150];
+function screamSyllable(when, vowel, pitch, dur) {
+  const o = audio.ctx.createOscillator();
+  o.type = "sawtooth";
+  o.frequency.setValueAtTime(pitch, when);
+  o.frequency.linearRampToValueAtTime(pitch * 1.08, when + dur); // 語尾を上げて悲鳴っぽく
+  const lfo = audio.ctx.createOscillator();
+  const lfoG = audio.ctx.createGain();
+  lfo.frequency.value = 22; lfoG.gain.value = pitch * 0.04;
+  lfo.connect(lfoG); lfoG.connect(o.frequency);
+  const f1 = audio.ctx.createBiquadFilter();
+  f1.type = "bandpass"; f1.frequency.value = vowel[0]; f1.Q.value = 7;
+  const f2 = audio.ctx.createBiquadFilter();
+  f2.type = "bandpass"; f2.frequency.value = vowel[1]; f2.Q.value = 9;
+  const g = audio.ctx.createGain();
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(0.6, when + 0.025);
+  g.gain.setValueAtTime(0.55, when + dur * 0.6);
+  g.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+  o.connect(f1); o.connect(f2);
+  f1.connect(g); f2.connect(g); g.connect(audio.sfxGain);
+  o.start(when); o.stop(when + dur + 0.05);
+  lfo.start(when); lfo.stop(when + dur + 0.05);
+}
+function playScream(startWhen) {
+  const syl = [
+    { v: VOWEL_GU, p: 300, d: 0.15 },
+    { v: VOWEL_GU, p: 330, d: 0.15 },
+    { v: VOWEL_GA, p: 380, d: 0.17 },
+    { v: VOWEL_GA, p: 450, d: 0.20 },
+  ];
+  let t = startWhen;
+  for (const s of syl) { screamSyllable(t, s.v, s.p, s.d); t += s.d + 0.015; }
+  return t;
+}
+let screamNextTime = 0;
+function updateScream() {
+  if (!audio.ctx || !audio.enabled) return;
+  const held = grab.active && grab.p && grab.p.state === S.HOKAKU;
+  if (held) {
+    const now = audio.ctx.currentTime;
+    if (screamNextTime < now + 0.05) {
+      const end = playScream(Math.max(now + 0.02, screamNextTime));
+      screamNextTime = end + 0.28; // 悲鳴の合間
+    }
+  } else {
+    screamNextTime = 0;
+  }
+}
+
+function setSound(on) {
+  audio.enabled = on;
+  localStorage.setItem(AUDIO_KEY, on ? "on" : "off");
+  if (audio.master) audio.master.gain.value = on ? 1 : 0;
+  const btn = document.getElementById("muteBtn");
+  if (btn) btn.textContent = on ? "🔊" : "🔇";
+}
+
+{
+  const muteBtn = document.getElementById("muteBtn");
+  muteBtn.textContent = audio.enabled ? "🔊" : "🔇";
+  muteBtn.addEventListener("click", () => { resumeAudio(); setSound(!audio.enabled); });
+}
+
 function startGame() {
   game.running = true;
   game.time = GAME_TIME;
@@ -1004,10 +1148,14 @@ function startGame() {
   scheduleSpawn();
   startOverlay.classList.add("hidden");
   endOverlay.classList.add("hidden");
+  resumeAudio();
+  startMusic();
 }
 
 function endGame() {
   game.running = false;
+  stopMusic();
+  screamNextTime = 0;
   grab.active = false;
   grab.p = null;
   pointer.down = false;
@@ -1041,6 +1189,7 @@ function loop(now) {
     updatePointer(dt);
     updatePenguins(dt);
     updateSpawner(dt);
+    updateScream();
   }
   updateEffects(dt);
 

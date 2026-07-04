@@ -49,7 +49,7 @@
     速く近づくと気づかれて逃げられるぞ！<br>
     掴んだら<strong>逃げる方向と逆</strong>にドラッグして張力ゲージをためて…ちぎり！<br>
     赤・青・白のレアなググガガは高得点。でもすぐ消えちゃう！<br>
-    しっぽは数秒で再生する。60秒でハイスコアを目指せ！
+    ちぎられたググガガは消えて、新しいのがやってくる。60秒でハイスコアを目指せ！
   </p>
   <button id="startBtn">スタート</button>
   <p id="bestLabel"></p>
@@ -83,7 +83,6 @@ resize();
 
 const BEST_KEY = "shippo-chigiri-best";
 const GAME_TIME = 60;
-const TAIL_REGROW_SEC = 4;
 const MAX_PENGUINS = 3;
 const SPAWN_MIN = 2, SPAWN_MAX = 5; // スポーン間隔(秒)
 const BLINK_WARN_SEC = 1.5;         // 消滅前の点滅警告
@@ -93,29 +92,30 @@ const FADE_SEC = 0.5;               // 時間切れフェードアウト
 // rate: 出現率 / points: ちぎり基礎点 / life: 出現からの寿命(秒)
 // tint: 起動時にオフスクリーンCanvasで生成する色調変換の設定
 // shape: 図形フォールバック時の色 / ui: 凡例ドット / pop: スコアポップ色
+// （ちぎられた個体はフェードアウトして退場するので、しっぽ再生は無い）
 const VARIANTS = {
   black: {
     key: "black", name: "黒", rate: 0.60, points: 100, life: Infinity,
     tint: null,
-    shape: { body: "#2c3e50", flipper: "#22303e", tail: "#2c3e50", stub: "#44586c" },
+    shape: { body: "#2c3e50", flipper: "#22303e", tail: "#2c3e50" },
     ui: "#2c3e50", pop: "#ffd76a",
   },
   red: {
     key: "red", name: "赤", rate: 0.25, points: 300, life: 8,
     tint: { color: "#ff2d20", alpha: 0.8 },
-    shape: { body: "#b03530", flipper: "#7c221c", tail: "#b03530", stub: "#8a4a44" },
+    shape: { body: "#b03530", flipper: "#7c221c", tail: "#b03530" },
     ui: "#ff5a4d", pop: "#ff8a7a",
   },
   blue: {
     key: "blue", name: "青", rate: 0.12, points: 500, life: 6,
     tint: { color: "#2f7bff", alpha: 0.8 },
-    shape: { body: "#2c55a8", flipper: "#1a4082", tail: "#2c55a8", stub: "#4a6a9c" },
+    shape: { body: "#2c55a8", flipper: "#1a4082", tail: "#2c55a8" },
     ui: "#4d8cff", pop: "#8fd4ff",
   },
   white: {
     key: "white", name: "白", rate: 0.03, points: 2000, life: 4,
     tint: { color: "#ffffff", alpha: 0.82 },
-    shape: { body: "#d3e2ee", flipper: "#aebfce", tail: "#d3e2ee", stub: "#c0cfdc" },
+    shape: { body: "#d3e2ee", flipper: "#aebfce", tail: "#d3e2ee" },
     ui: "#ffffff", pop: "#ffffff",
   },
 };
@@ -312,7 +312,6 @@ function makePenguin(v, x, y) {
     stateTimer: 0,
     targetX: 0, targetY: 0,
     hasTail: true,
-    tailRegrow: 0,
     waddle: rand(0, 10),
     r: 26,             // body radius
     life: v.life,      // 出現からの残り寿命(秒)
@@ -461,7 +460,6 @@ function sparkle(x, y) {
 function tear(p) {
   const t = tailPos(p);
   p.hasTail = false;
-  p.tailRegrow = TAIL_REGROW_SEC;
   grab.active = false;
   grab.p = null;
   grab.tension = 0;
@@ -471,7 +469,8 @@ function tear(p) {
   burst(t.x, t.y);
   popup(t.x, t.y - 20, "ちぎり！", "#ff6a8a");
   popup(t.x, t.y - 56, `+${pts}` + (game.combo > 1 ? ` (x${game.combo})` : ""), p.v.pop);
-  setState(p, S.TOSO, 1.6);
+  // ちぎられたググガガはフェードアウトして退場（次のスポーンはspawnerが補充）
+  startFade(p);
 }
 
 // ---------- update ----------
@@ -514,16 +513,6 @@ function updatePenguin(p, dt) {
 
   p.stateTimer -= dt;
   p.waddle += dt * 10;
-
-  // tail regrowth
-  if (!p.hasTail) {
-    p.tailRegrow -= dt;
-    if (p.tailRegrow <= 0) {
-      p.hasTail = true;
-      const t = tailPos(p);
-      popup(t.x, t.y - 24, "しっぽ再生！", "#8fffb0");
-    }
-  }
 
   const dToPointer = dist(p.x, p.y, pointer.x, pointer.y);
 
@@ -698,7 +687,7 @@ function drawTailSprite(p, tt, bob, scale) {
 }
 
 function drawPenguinSprite(p, bob) {
-  // しっぽ(再生中は途中サイズ)を体より先に描く
+  // しっぽを体より先に描く（ちぎられた後はしっぽなしのままフェードアウト）
   const tt = tailTransform(p);
   if (p.hasTail) {
     drawTailSprite(p, tt, bob, 1);
@@ -709,9 +698,6 @@ function drawPenguinSprite(p, bob) {
       ctx.arc(g.x, g.y + bob, 20, 0, Math.PI * 2);
       ctx.fill();
     }
-  } else {
-    const prog = 1 - p.tailRegrow / TAIL_REGROW_SEC;
-    if (prog > 0.05) drawTailSprite(p, tt, bob, prog);
   }
 
   // 正面向きスプライトは回転させず、左向き移動時だけ左右ミラー
@@ -741,19 +727,6 @@ function drawPenguinShapes(p, bob) {
     ctx.moveTo(p.r - 6, 0);
     ctx.lineTo(p.r + 20, -9);
     ctx.lineTo(p.r + 20, 9);
-    ctx.closePath();
-    ctx.fill();
-    ctx.restore();
-  } else {
-    // regrowing stub
-    const prog = 1 - p.tailRegrow / TAIL_REGROW_SEC;
-    ctx.save();
-    ctx.rotate(angle + Math.PI);
-    ctx.fillStyle = col.stub;
-    ctx.beginPath();
-    ctx.moveTo(p.r - 6, 0);
-    ctx.lineTo(p.r - 6 + 26 * prog, -9 * prog);
-    ctx.lineTo(p.r - 6 + 26 * prog, 9 * prog);
     ctx.closePath();
     ctx.fill();
     ctx.restore();

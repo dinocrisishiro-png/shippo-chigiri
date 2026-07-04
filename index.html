@@ -484,6 +484,7 @@ function tear(p) {
   game.combo++;
   const pts = p.v.points * game.combo;
   game.score += pts;
+  playPluck();
   burst(t.x, t.y);
   popup(t.x, t.y - 20, "ちぎり！", "#ff6a8a");
   popup(t.x, t.y - 56, `+${pts}` + (game.combo > 1 ? ` (x${game.combo})` : ""), p.v.pop);
@@ -1116,6 +1117,39 @@ function updateScream() {
   } else {
     screamNextTime = 0;
   }
+}
+
+// しっぽがちぎれた瞬間の「プツン」（クリック感の"プ" + 一気に下がるピッチの"ツン"）
+function playPluck() {
+  if (!audio.ctx || !audio.enabled) return;
+  const t = audio.ctx.currentTime + 0.001;
+
+  // "プ": ごく短いノイズのスナップ（ハイパスで弾ける質感に）
+  const len = Math.floor(audio.ctx.sampleRate * 0.05);
+  const buf = audio.ctx.createBuffer(1, len, audio.ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3);
+  const nb = audio.ctx.createBufferSource();
+  nb.buffer = buf;
+  const hp = audio.ctx.createBiquadFilter();
+  hp.type = "highpass"; hp.frequency.value = 1800;
+  const ng = audio.ctx.createGain();
+  ng.gain.setValueAtTime(0.55, t);
+  ng.gain.exponentialRampToValueAtTime(0.0008, t + 0.05);
+  nb.connect(hp); hp.connect(ng); ng.connect(audio.sfxGain);
+  nb.start(t); nb.stop(t + 0.06);
+
+  // "ツン": ピッチが一気に下がる撥弦っぽいトーン（速い減衰で気持ちよく）
+  const o = audio.ctx.createOscillator();
+  o.type = "triangle";
+  o.frequency.setValueAtTime(900, t);
+  o.frequency.exponentialRampToValueAtTime(150, t + 0.11);
+  const g = audio.ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(0.5, t + 0.005);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+  o.connect(g); g.connect(audio.sfxGain);
+  o.start(t); o.stop(t + 0.2);
 }
 
 function setSound(on) {

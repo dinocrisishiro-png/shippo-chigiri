@@ -28,11 +28,18 @@
 
 ## スプライト描画
 
-- `assets/gugugaga_idle.png`（のんびり）/ `assets/gugugaga_alert.png`（警戒・逃走・捕獲）/ `assets/tail.png` を `drawImage` で描画
-- しっぽの掴み判定アンカーは画像内の相対座標（`SPRITE_DEFS.tail.grab`）で定義
+- `assets/gugugaga_idle.png`（正面向き・全ステート共通）と `assets/tail.png` を `drawImage` で描画
+- 左向き移動時は左右ミラー、警戒ステートは「！」オーバーレイで表現
+- しっぽの付け根は体スプライトのお尻位置（`SPRITE_DEFS.idle.butt`）、掴み判定はしっぽ画像の先端（`SPRITE_DEFS.tail.grab`）の相対座標アンカーで定義
+- `assets/tail.png` は本体画像の黒い生地部分を切り出してティアドロップ型に加工したもの
 - 画像のロードに失敗した場合は従来の図形描画に自動フォールバック
 
 ## 更新履歴
+
+### v0.3
+
+- 体スプライトを実写風の透過PNG（背景除去済み写真、高さ768px）に差し替え
+- しっぽは本体画像の生地質感を切り出して合成、警戒スプライトは「！」オーバーレイに統合
 
 ### v0.2
 

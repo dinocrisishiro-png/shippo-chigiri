@@ -86,18 +86,22 @@ const TAIL_REGROW_SEC = 4;
 
 // ---------- sprites ----------
 // アンカーは画像内の相対座標(0..1)で定義する
+// 体は正面向きの1枚のみ。警戒は「！」オーバーレイで表現し、
+// 左向き移動時は左右ミラーで対応する
 const SPRITE_DEFS = {
-  idle:  { src: "assets/gugugaga_idle.png" },
-  alert: { src: "assets/gugugaga_alert.png" },
-  tail:  {
+  idle: {
+    src: "assets/gugugaga_idle.png",
+    butt: { x: 0.5, y: 0.85 }, // しっぽ付け根(お尻)の相対座標
+  },
+  tail: {
     src: "assets/tail.png",
-    attach: { x: 0.88, y: 0.5 }, // 体との接続点
-    grab:   { x: 0.18, y: 0.5 }, // 掴み判定アンカー(先端)
+    attach: { x: 0.86, y: 0.5 }, // 付け根側
+    grab:   { x: 0.15, y: 0.5 }, // 掴み判定アンカー(先端)
   },
 };
-const BODY_DRAW_SIZE = 140; // 体スプライトの描画サイズ(px)
-const TAIL_DRAW_W = 52;
-const TAIL_DRAW_H = 39;
+const BODY_DRAW_H = 132; // 体スプライトの描画高さ(px)。幅は画像アスペクト比から
+const TAIL_DRAW_W = 68;
+const TAIL_DRAW_H = 44;
 
 const sprites = {};
 let spritesReady = false; // 1枚でもロード失敗したらfalseのまま→図形描画にフォールバック
@@ -159,10 +163,30 @@ const rand = (a, b) => a + Math.random() * (b - a);
 const dist = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
+function bodySpriteRect() {
+  // 足元を影の位置に接地させた体スプライトの配置
+  const img = sprites.idle;
+  const h = BODY_DRAW_H;
+  const w = h * img.naturalWidth / img.naturalHeight;
+  const footY = penguin.y + penguin.r + 6;
+  return { w, h, top: footY - h };
+}
+
 function tailTransform() {
   // しっぽ付け根のワールド座標と回転。tail.pngは左向き(先端が-x側)なので
   // facing方向にそのまま回転させると先端が後ろへ突き出る
   const wig = Math.sin(penguin.waddle * 1.5) * 0.25;
+  if (spritesReady) {
+    // 付け根 = 体スプライトのお尻位置(相対座標アンカー)
+    const b = bodySpriteRect();
+    const butt = SPRITE_DEFS.idle.butt;
+    const mirror = Math.cos(penguin.angle) < 0;
+    return {
+      x: penguin.x + (butt.x - 0.5) * b.w * (mirror ? -1 : 1),
+      y: b.top + butt.y * b.h,
+      rot: penguin.angle + wig,
+    };
+  }
   return {
     x: penguin.x - Math.cos(penguin.angle) * (penguin.r - 6),
     y: penguin.y - Math.sin(penguin.angle) * (penguin.r - 6),
@@ -480,13 +504,12 @@ function drawPenguinSprite(bob) {
     if (p > 0.05) drawTailSprite(tt, bob, p);
   }
 
-  // ステートでスプライト切替: のんびり=idle / 警戒・逃走・捕獲=alert
-  const img = penguin.state === S.NONBIRI ? sprites.idle : sprites.alert;
+  // 正面向きスプライトは回転させず、左向き移動時だけ左右ミラー
+  const b = bodySpriteRect();
   ctx.save();
   ctx.translate(penguin.x, penguin.y + bob);
-  ctx.rotate(penguin.angle);
-  if (Math.cos(penguin.angle) < 0) ctx.scale(1, -1); // 左向きで上下逆さまにならないように
-  ctx.drawImage(img, -BODY_DRAW_SIZE / 2, -BODY_DRAW_SIZE / 2, BODY_DRAW_SIZE, BODY_DRAW_SIZE);
+  if (Math.cos(penguin.angle) < 0) ctx.scale(-1, 1);
+  ctx.drawImage(sprites.idle, -b.w / 2, b.top - penguin.y, b.w, b.h);
   ctx.restore();
 }
 
@@ -590,12 +613,13 @@ function drawPenguinShapes(bob) {
 function drawPenguinOverlays(bob) {
   const { x, y } = penguin;
 
-  // "!" alert mark
+  // "!" alert mark (スプライトの頭上に出す)
   if (penguin.state === S.KEIKAI) {
+    const topY = spritesReady ? bodySpriteRect().top : y - penguin.r - 24;
     ctx.fillStyle = "#ffd76a";
     ctx.font = "bold 34px sans-serif";
     ctx.textAlign = "center";
-    ctx.fillText("！", x, y - penguin.r - 24 + bob);
+    ctx.fillText("！", x, topY - 8 + bob);
   }
 
   // tension gauge while grabbing

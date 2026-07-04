@@ -48,6 +48,7 @@
     ペンギンの「ググガガ」にそーっと近づいて、しっぽを掴もう。<br>
     速く近づくと気づかれて逃げられるぞ！<br>
     掴んだら<strong>逃げる方向と逆</strong>にドラッグして張力ゲージをためて…ちぎり！<br>
+    赤・青・白のレアなググガガは高得点。でもすぐ消えちゃう！<br>
     しっぽは数秒で再生する。60秒でハイスコアを目指せ！
   </p>
   <button id="startBtn">スタート</button>
@@ -83,6 +84,50 @@ resize();
 const BEST_KEY = "shippo-chigiri-best";
 const GAME_TIME = 60;
 const TAIL_REGROW_SEC = 4;
+const MAX_PENGUINS = 3;
+const SPAWN_MIN = 2, SPAWN_MAX = 5; // スポーン間隔(秒)
+const BLINK_WARN_SEC = 1.5;         // 消滅前の点滅警告
+const FADE_SEC = 0.5;               // 時間切れフェードアウト
+
+// ---------- color variants ----------
+// rate: 出現率 / points: ちぎり基礎点 / life: 出現からの寿命(秒)
+// tint: 起動時にオフスクリーンCanvasで生成する色調変換の設定
+// shape: 図形フォールバック時の色 / ui: 凡例ドット / pop: スコアポップ色
+const VARIANTS = {
+  black: {
+    key: "black", name: "黒", rate: 0.60, points: 100, life: Infinity,
+    tint: null,
+    shape: { body: "#2c3e50", flipper: "#22303e", tail: "#2c3e50", stub: "#44586c" },
+    ui: "#2c3e50", pop: "#ffd76a",
+  },
+  red: {
+    key: "red", name: "赤", rate: 0.25, points: 300, life: 8,
+    tint: { color: "#ff2d20", alpha: 0.8 },
+    shape: { body: "#b03530", flipper: "#7c221c", tail: "#b03530", stub: "#8a4a44" },
+    ui: "#ff5a4d", pop: "#ff8a7a",
+  },
+  blue: {
+    key: "blue", name: "青", rate: 0.12, points: 500, life: 6,
+    tint: { color: "#2f7bff", alpha: 0.8 },
+    shape: { body: "#2c55a8", flipper: "#1a4082", tail: "#2c55a8", stub: "#4a6a9c" },
+    ui: "#4d8cff", pop: "#8fd4ff",
+  },
+  white: {
+    key: "white", name: "白", rate: 0.03, points: 2000, life: 4,
+    tint: { color: "#ffffff", alpha: 0.82 },
+    shape: { body: "#d3e2ee", flipper: "#aebfce", tail: "#d3e2ee", stub: "#c0cfdc" },
+    ui: "#ffffff", pop: "#ffffff",
+  },
+};
+
+function pickVariant() {
+  let r = Math.random();
+  for (const v of Object.values(VARIANTS)) {
+    r -= v.rate;
+    if (r < 0) return v;
+  }
+  return VARIANTS.black;
+}
 
 // ---------- sprites ----------
 // アンカーは画像内の相対座標(0..1)で定義する
@@ -104,17 +149,57 @@ const TAIL_DRAW_W = 68;
 const TAIL_DRAW_H = 44;
 
 const sprites = {};
+const tinted = {}; // variant key -> { idle, tail } (色調変換済みオフスクリーンCanvas)
 let spritesReady = false; // 1枚でもロード失敗したらfalseのまま→図形描画にフォールバック
+
+// screen合成で明度を持ち上げつつ着色し、元画像のアルファでマスクし直す。
+// 毎フレームのfilter適用を避けるため起動時に一度だけ生成する（スマホ性能優先）
+function tintImage(img, color, alpha) {
+  const c = document.createElement("canvas");
+  c.width = img.naturalWidth;
+  c.height = img.naturalHeight;
+  const g = c.getContext("2d");
+  g.drawImage(img, 0, 0);
+  g.globalCompositeOperation = "screen";
+  g.globalAlpha = alpha;
+  g.fillStyle = color;
+  g.fillRect(0, 0, c.width, c.height);
+  g.globalAlpha = 1;
+  g.globalCompositeOperation = "destination-in";
+  g.drawImage(img, 0, 0);
+  return c;
+}
+
+function buildTintedSprites() {
+  for (const v of Object.values(VARIANTS)) {
+    if (!v.tint) continue;
+    tinted[v.key] = {
+      idle: tintImage(sprites.idle, v.tint.color, v.tint.alpha),
+      tail: tintImage(sprites.tail, v.tint.color, v.tint.alpha),
+    };
+  }
+}
+
 {
   let pending = Object.keys(SPRITE_DEFS).length;
   let failed = false;
   for (const [key, def] of Object.entries(SPRITE_DEFS)) {
     const img = new Image();
-    img.onload = () => { if (--pending === 0 && !failed) spritesReady = true; };
+    img.onload = () => {
+      if (--pending === 0 && !failed) {
+        buildTintedSprites();
+        spritesReady = true;
+      }
+    };
     img.onerror = () => { failed = true; console.warn(`sprite load failed: ${def.src} — 図形描画にフォールバック`); };
     img.src = def.src;
     sprites[key] = img;
   }
+}
+
+function spriteImg(p, kind) {
+  const t = tinted[p.v.key];
+  return t ? t[kind] : sprites[kind];
 }
 
 // penguin state machine
@@ -128,18 +213,8 @@ const game = {
   best: Number(localStorage.getItem(BEST_KEY) || 0),
 };
 
-const penguin = {
-  x: 0, y: 0,
-  angle: 0,          // facing direction
-  speed: 0,
-  state: S.NONBIRI,
-  stateTimer: 0,
-  targetX: 0, targetY: 0,
-  hasTail: true,
-  tailRegrow: 0,
-  waddle: 0,
-  r: 26,             // body radius
-};
+let penguins = [];
+const spawner = { timer: 0 };
 
 const pointer = {
   x: -999, y: -999,
@@ -152,53 +227,55 @@ const pointer = {
 
 const grab = {
   active: false,
+  p: null,           // 掴んでいるペンギン
   tension: 0,        // 0..1
 };
 
 let particles = [];
 let popups = [];     // floating texts
+let rings = [];      // 白出現時のキラッとエフェクト
 
 // ---------- helpers ----------
 const rand = (a, b) => a + Math.random() * (b - a);
 const dist = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
-function bodySpriteRect() {
+function bodySpriteRect(p) {
   // 足元を影の位置に接地させた体スプライトの配置
   const img = sprites.idle;
   const h = BODY_DRAW_H;
   const w = h * img.naturalWidth / img.naturalHeight;
-  const footY = penguin.y + penguin.r + 6;
+  const footY = p.y + p.r + 6;
   return { w, h, top: footY - h };
 }
 
-function tailTransform() {
+function tailTransform(p) {
   // しっぽ付け根のワールド座標と回転。tail.pngは左向き(先端が-x側)なので
   // facing方向にそのまま回転させると先端が後ろへ突き出る
-  const wig = Math.sin(penguin.waddle * 1.5) * 0.25;
+  const wig = Math.sin(p.waddle * 1.5) * 0.25;
   if (spritesReady) {
     // 付け根 = 体スプライトのお尻位置(相対座標アンカー)
-    const b = bodySpriteRect();
+    const b = bodySpriteRect(p);
     const butt = SPRITE_DEFS.idle.butt;
-    const mirror = Math.cos(penguin.angle) < 0;
+    const mirror = Math.cos(p.angle) < 0;
     return {
-      x: penguin.x + (butt.x - 0.5) * b.w * (mirror ? -1 : 1),
+      x: p.x + (butt.x - 0.5) * b.w * (mirror ? -1 : 1),
       y: b.top + butt.y * b.h,
-      rot: penguin.angle + wig,
+      rot: p.angle + wig,
     };
   }
   return {
-    x: penguin.x - Math.cos(penguin.angle) * (penguin.r - 6),
-    y: penguin.y - Math.sin(penguin.angle) * (penguin.r - 6),
-    rot: penguin.angle + wig,
+    x: p.x - Math.cos(p.angle) * (p.r - 6),
+    y: p.y - Math.sin(p.angle) * (p.r - 6),
+    rot: p.angle + wig,
   };
 }
 
-function tailPos() {
+function tailPos(p) {
   if (spritesReady) {
     // 画像内の相対座標アンカー(grab)をワールド座標へ変換
     const def = SPRITE_DEFS.tail;
-    const t = tailTransform();
+    const t = tailTransform(p);
     const lx = (def.grab.x - def.attach.x) * TAIL_DRAW_W;
     const ly = (def.grab.y - def.attach.y) * TAIL_DRAW_H;
     return {
@@ -208,29 +285,87 @@ function tailPos() {
   }
   // フォールバック(図形描画)時: 体の後方に固定オフセット
   return {
-    x: penguin.x - Math.cos(penguin.angle) * (penguin.r + 14),
-    y: penguin.y - Math.sin(penguin.angle) * (penguin.r + 14),
+    x: p.x - Math.cos(p.angle) * (p.r + 14),
+    y: p.y - Math.sin(p.angle) * (p.r + 14),
   };
 }
 
-function pickWanderTarget() {
+function pickWanderTarget(p) {
   const m = 70;
-  penguin.targetX = rand(m, W - m);
-  penguin.targetY = rand(m, H - m);
+  p.targetX = rand(m, W - m);
+  p.targetY = rand(m, H - m);
 }
 
-function setState(s, t = 0) {
-  penguin.state = s;
-  penguin.stateTimer = t;
+function setState(p, s, t = 0) {
+  p.state = s;
+  p.stateTimer = t;
 }
 
-function resetPenguin() {
-  penguin.x = W / 2;
-  penguin.y = H / 2;
-  penguin.hasTail = true;
-  penguin.tailRegrow = 0;
-  setState(S.NONBIRI);
-  pickWanderTarget();
+// ---------- spawning ----------
+function makePenguin(v, x, y) {
+  const p = {
+    v,
+    x, y,
+    angle: rand(0, Math.PI * 2), // facing direction
+    speed: 0,
+    state: S.NONBIRI,
+    stateTimer: 0,
+    targetX: 0, targetY: 0,
+    hasTail: true,
+    tailRegrow: 0,
+    waddle: rand(0, 10),
+    r: 26,             // body radius
+    life: v.life,      // 出現からの残り寿命(秒)
+    fading: false,
+    fade: 0,
+    dead: false,
+  };
+  pickWanderTarget(p);
+  return p;
+}
+
+function spawnPos() {
+  // ポインタや既存ペンギンの真上に湧かないよう数回リトライ
+  const m = 70;
+  for (let i = 0; i < 12; i++) {
+    const x = rand(m, W - m), y = rand(m, H - m);
+    if (dist(x, y, pointer.x, pointer.y) < 140) continue;
+    if (penguins.some((p) => dist(x, y, p.x, p.y) < 120)) continue;
+    return { x, y };
+  }
+  return { x: rand(m, W - m), y: rand(m, H - m) };
+}
+
+function spawnPenguin(variant) {
+  const v = variant || pickVariant();
+  const pos = spawnPos();
+  const p = makePenguin(v, pos.x, pos.y);
+  penguins.push(p);
+  if (v.key === "white") sparkle(p.x, p.y - 40); // 白はキラッと登場
+  return p;
+}
+
+function scheduleSpawn() {
+  spawner.timer = rand(SPAWN_MIN, SPAWN_MAX);
+}
+
+function updateSpawner(dt) {
+  if (penguins.length === 0) {
+    // 寿命切れで全滅したら即補充（常時1体以上を保証）
+    spawnPenguin();
+    scheduleSpawn();
+    return;
+  }
+  spawner.timer -= dt;
+  if (spawner.timer <= 0) {
+    if (penguins.length < MAX_PENGUINS) spawnPenguin();
+    scheduleSpawn();
+  }
+}
+
+function resetPenguins() {
+  penguins = [makePenguin(VARIANTS.black, W / 2, H / 2)];
+  scheduleSpawn();
 }
 
 // ---------- pointer events (mouse / touch unified) ----------
@@ -243,15 +378,21 @@ canvas.addEventListener("pointerdown", (e) => {
   pointer.x = pointer.px = e.clientX;
   pointer.y = pointer.py = e.clientY;
 
-  // try to grab the tail
-  if (penguin.hasTail && penguin.state !== S.HOKAKU) {
-    const t = tailPos();
-    if (dist(e.clientX, e.clientY, t.x, t.y) < 42) {
-      grab.active = true;
-      grab.tension = 0;
-      setState(S.HOKAKU);
-      popup(t.x, t.y - 30, "つかんだ！", "#8fd4ff");
-    }
+  // try to grab the nearest tail
+  let target = null, targetD = 42;
+  for (const p of penguins) {
+    if (!p.hasTail || p.fading || p.state === S.HOKAKU) continue;
+    const t = tailPos(p);
+    const d = dist(e.clientX, e.clientY, t.x, t.y);
+    if (d < targetD) { target = p; targetD = d; }
+  }
+  if (target) {
+    grab.active = true;
+    grab.p = target;
+    grab.tension = 0;
+    setState(target, S.HOKAKU);
+    const t = tailPos(target);
+    popup(t.x, t.y - 30, "つかんだ！", "#8fd4ff");
   }
 });
 
@@ -267,11 +408,13 @@ function releasePointer(e) {
   pointer.down = false;
   if (grab.active) {
     // let go before tearing -> penguin escapes
+    const p = grab.p;
     grab.active = false;
+    grab.p = null;
     grab.tension = 0;
     game.combo = 0;
-    popup(penguin.x, penguin.y - 50, "にげられた…", "#aab6c2");
-    setState(S.TOSO, 1.2);
+    popup(p.x, p.y - 50, "にげられた…", "#aab6c2");
+    setState(p, S.TOSO, 1.2);
   }
 }
 canvas.addEventListener("pointerup", releasePointer);
@@ -297,20 +440,38 @@ function burst(x, y) {
   }
 }
 
+function sparkle(x, y) {
+  // 白出現時のキラッと（拡がる光輪 + 光の粒）。音は鳴らさない
+  rings.push({ x, y, life: 0.6, max: 0.6 });
+  for (let i = 0; i < 22; i++) {
+    const a = rand(0, Math.PI * 2);
+    const sp = rand(40, 200);
+    particles.push({
+      x, y,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp - 60,
+      life: rand(0.4, 0.8),
+      color: Math.random() < 0.5 ? "#ffffff" : "#fff3b0",
+      r: rand(1.5, 3.5),
+    });
+  }
+}
+
 // ---------- tear! ----------
-function tear() {
-  const t = tailPos();
-  penguin.hasTail = false;
-  penguin.tailRegrow = TAIL_REGROW_SEC;
+function tear(p) {
+  const t = tailPos(p);
+  p.hasTail = false;
+  p.tailRegrow = TAIL_REGROW_SEC;
   grab.active = false;
+  grab.p = null;
   grab.tension = 0;
   game.combo++;
-  const pts = 100 * game.combo;
+  const pts = p.v.points * game.combo;
   game.score += pts;
   burst(t.x, t.y);
   popup(t.x, t.y - 20, "ちぎり！", "#ff6a8a");
-  popup(t.x, t.y - 56, `+${pts}` + (game.combo > 1 ? ` (x${game.combo})` : ""), "#ffd76a");
-  setState(S.TOSO, 1.6);
+  popup(t.x, t.y - 56, `+${pts}` + (game.combo > 1 ? ` (x${game.combo})` : ""), p.v.pop);
+  setState(p, S.TOSO, 1.6);
 }
 
 // ---------- update ----------
@@ -324,65 +485,91 @@ function updatePointer(dt) {
   pointer.py = pointer.y;
 }
 
-function updatePenguin(dt) {
-  penguin.stateTimer -= dt;
-  penguin.waddle += dt * 10;
+function startFade(p) {
+  p.fading = true;
+  p.fade = FADE_SEC;
+  if (grab.p === p) {
+    // 掴んでいる最中に寿命切れ: 手からすり抜けて消える(コンボは維持)
+    grab.active = false;
+    grab.p = null;
+    grab.tension = 0;
+    popup(p.x, p.y - 50, "きえちゃった…", "#aab6c2");
+  }
+}
+
+function updatePenguin(p, dt) {
+  // lifetime (色付きバリアントのみ有限)
+  if (p.fading) {
+    p.fade -= dt;
+    if (p.fade <= 0) p.dead = true;
+    return;
+  }
+  if (isFinite(p.life)) {
+    p.life -= dt;
+    if (p.life <= 0) {
+      startFade(p);
+      return;
+    }
+  }
+
+  p.stateTimer -= dt;
+  p.waddle += dt * 10;
 
   // tail regrowth
-  if (!penguin.hasTail) {
-    penguin.tailRegrow -= dt;
-    if (penguin.tailRegrow <= 0) {
-      penguin.hasTail = true;
-      const t = tailPos();
+  if (!p.hasTail) {
+    p.tailRegrow -= dt;
+    if (p.tailRegrow <= 0) {
+      p.hasTail = true;
+      const t = tailPos(p);
       popup(t.x, t.y - 24, "しっぽ再生！", "#8fffb0");
     }
   }
 
-  const dToPointer = dist(penguin.x, penguin.y, pointer.x, pointer.y);
+  const dToPointer = dist(p.x, p.y, pointer.x, pointer.y);
 
-  switch (penguin.state) {
+  switch (p.state) {
     case S.NONBIRI: {
       // waddle toward wander target
-      const d = dist(penguin.x, penguin.y, penguin.targetX, penguin.targetY);
-      if (d < 20) pickWanderTarget();
-      const a = Math.atan2(penguin.targetY - penguin.y, penguin.targetX - penguin.x);
-      penguin.angle += Math.atan2(Math.sin(a - penguin.angle), Math.cos(a - penguin.angle)) * dt * 3;
-      penguin.speed = 45;
+      const d = dist(p.x, p.y, p.targetX, p.targetY);
+      if (d < 20) pickWanderTarget(p);
+      const a = Math.atan2(p.targetY - p.y, p.targetX - p.x);
+      p.angle += Math.atan2(Math.sin(a - p.angle), Math.cos(a - p.angle)) * dt * 3;
+      p.speed = 45;
       // notice a fast-approaching pointer
       if (dToPointer < 160 && pointer.speed > 350) {
-        setState(S.KEIKAI, 0.45);
-        penguin.speed = 0;
+        setState(p, S.KEIKAI, 0.45);
+        p.speed = 0;
       }
       break;
     }
     case S.KEIKAI: {
       // freeze with "!" then flee
-      penguin.speed = 0;
-      if (penguin.stateTimer <= 0) setState(S.TOSO, 1.5);
+      p.speed = 0;
+      if (p.stateTimer <= 0) setState(p, S.TOSO, 1.5);
       break;
     }
     case S.TOSO: {
       // run away from the pointer
-      const a = Math.atan2(penguin.y - pointer.y, penguin.x - pointer.x);
-      penguin.angle += Math.atan2(Math.sin(a - penguin.angle), Math.cos(a - penguin.angle)) * dt * 8;
-      penguin.speed = 240;
+      const a = Math.atan2(p.y - pointer.y, p.x - pointer.x);
+      p.angle += Math.atan2(Math.sin(a - p.angle), Math.cos(a - p.angle)) * dt * 8;
+      p.speed = 240;
       // keep fleeing while the pointer stays close
-      if (dToPointer < 200) penguin.stateTimer = Math.max(penguin.stateTimer, 0.5);
-      if (penguin.stateTimer <= 0) {
-        setState(S.NONBIRI);
-        pickWanderTarget();
+      if (dToPointer < 200) p.stateTimer = Math.max(p.stateTimer, 0.5);
+      if (p.stateTimer <= 0) {
+        setState(p, S.NONBIRI);
+        pickWanderTarget(p);
       }
       break;
     }
     case S.HOKAKU: {
       // caught by the tail: struggles away from the pointer
-      const fleeA = Math.atan2(penguin.y - pointer.y, penguin.x - pointer.x);
-      penguin.angle = fleeA;
-      penguin.speed = 30;
-      penguin.x += Math.cos(fleeA + Math.sin(penguin.waddle * 3) * 0.6) * 40 * dt;
+      const fleeA = Math.atan2(p.y - pointer.y, p.x - pointer.x);
+      p.angle = fleeA;
+      p.speed = 30;
+      p.x += Math.cos(fleeA + Math.sin(p.waddle * 3) * 0.6) * 40 * dt;
 
       // tension: drag opposite to the flee direction
-      const t = tailPos();
+      const t = tailPos(p);
       const pullX = pointer.x - t.x;
       const pullY = pointer.y - t.y;
       const pullLen = Math.hypot(pullX, pullY);
@@ -395,38 +582,44 @@ function updatePenguin(dt) {
       }
       grab.tension -= dt * 0.25; // constant decay
       grab.tension = clamp(grab.tension, 0, 1);
-      if (grab.tension >= 1) tear();
+      if (grab.tension >= 1) tear(p);
 
       // dragged too far -> slips out of your hand
       if (pullLen > 220) {
         grab.active = false;
+        grab.p = null;
         grab.tension = 0;
         game.combo = 0;
         popup(t.x, t.y - 30, "すっぽ抜けた！", "#aab6c2");
-        setState(S.TOSO, 1.2);
+        setState(p, S.TOSO, 1.2);
       }
       break;
     }
   }
 
   // move
-  if (penguin.state !== S.HOKAKU) {
-    penguin.x += Math.cos(penguin.angle) * penguin.speed * dt;
-    penguin.y += Math.sin(penguin.angle) * penguin.speed * dt;
+  if (p.state !== S.HOKAKU) {
+    p.x += Math.cos(p.angle) * p.speed * dt;
+    p.y += Math.sin(p.angle) * p.speed * dt;
   }
 
   // stay on screen
   const m = 40;
-  if (penguin.x < m || penguin.x > W - m || penguin.y < m || penguin.y > H - m) {
-    penguin.x = clamp(penguin.x, m, W - m);
-    penguin.y = clamp(penguin.y, m, H - m);
-    if (penguin.state === S.TOSO) {
+  if (p.x < m || p.x > W - m || p.y < m || p.y > H - m) {
+    p.x = clamp(p.x, m, W - m);
+    p.y = clamp(p.y, m, H - m);
+    if (p.state === S.TOSO) {
       // bounce along the wall
-      penguin.angle = Math.atan2(H / 2 - penguin.y, W / 2 - penguin.x) + rand(-0.8, 0.8);
-    } else if (penguin.state === S.NONBIRI) {
-      pickWanderTarget();
+      p.angle = Math.atan2(H / 2 - p.y, W / 2 - p.x) + rand(-0.8, 0.8);
+    } else if (p.state === S.NONBIRI) {
+      pickWanderTarget(p);
     }
   }
+}
+
+function updatePenguins(dt) {
+  for (const p of penguins) updatePenguin(p, dt);
+  penguins = penguins.filter((p) => !p.dead);
 }
 
 function updateEffects(dt) {
@@ -441,6 +634,10 @@ function updateEffects(dt) {
     p.life -= dt * 0.8;
     p.y -= 40 * dt;
     return p.life > 0;
+  });
+  rings = rings.filter((r) => {
+    r.life -= dt;
+    return r.life > 0;
   });
 }
 
@@ -461,121 +658,135 @@ function drawBackground() {
   }
 }
 
-function drawPenguin() {
-  const bob = penguin.speed > 1 ? Math.sin(penguin.waddle) * 2.5 : 0;
+function penguinAlpha(p) {
+  if (p.fading) return clamp(p.fade / FADE_SEC, 0, 1);
+  // 消滅の1.5秒前から点滅で警告
+  if (isFinite(p.life) && p.life < BLINK_WARN_SEC) {
+    return Math.floor(p.life * 8) % 2 === 0 ? 1 : 0.25;
+  }
+  return 1;
+}
+
+function drawPenguin(p) {
+  const bob = p.speed > 1 ? Math.sin(p.waddle) * 2.5 : 0;
+
+  ctx.globalAlpha = penguinAlpha(p);
 
   // shadow
   ctx.fillStyle = "rgba(0,0,0,0.3)";
   ctx.beginPath();
-  ctx.ellipse(penguin.x, penguin.y + penguin.r + 8, penguin.r * 0.9, 8, 0, 0, Math.PI * 2);
+  ctx.ellipse(p.x, p.y + p.r + 8, p.r * 0.9, 8, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  if (spritesReady) drawPenguinSprite(bob);
-  else drawPenguinShapes(bob);
+  if (spritesReady) drawPenguinSprite(p, bob);
+  else drawPenguinShapes(p, bob);
 
-  drawPenguinOverlays(bob);
+  drawPenguinOverlays(p, bob);
+
+  ctx.globalAlpha = 1;
 }
 
-function drawTailSprite(tt, bob, scale) {
+function drawTailSprite(p, tt, bob, scale) {
   const def = SPRITE_DEFS.tail;
   const w = TAIL_DRAW_W * scale;
   const h = TAIL_DRAW_H * scale;
   ctx.save();
   ctx.translate(tt.x, tt.y + bob);
   ctx.rotate(tt.rot);
-  ctx.drawImage(sprites.tail, -def.attach.x * w, -def.attach.y * h, w, h);
+  ctx.drawImage(spriteImg(p, "tail"), -def.attach.x * w, -def.attach.y * h, w, h);
   ctx.restore();
 }
 
-function drawPenguinSprite(bob) {
+function drawPenguinSprite(p, bob) {
   // しっぽ(再生中は途中サイズ)を体より先に描く
-  const tt = tailTransform();
-  if (penguin.hasTail) {
-    drawTailSprite(tt, bob, 1);
-    if (grab.active) {
-      const g = tailPos();
+  const tt = tailTransform(p);
+  if (p.hasTail) {
+    drawTailSprite(p, tt, bob, 1);
+    if (grab.active && grab.p === p) {
+      const g = tailPos(p);
       ctx.fillStyle = "rgba(255, 180, 94, 0.35)";
       ctx.beginPath();
       ctx.arc(g.x, g.y + bob, 20, 0, Math.PI * 2);
       ctx.fill();
     }
   } else {
-    const p = 1 - penguin.tailRegrow / TAIL_REGROW_SEC;
-    if (p > 0.05) drawTailSprite(tt, bob, p);
+    const prog = 1 - p.tailRegrow / TAIL_REGROW_SEC;
+    if (prog > 0.05) drawTailSprite(p, tt, bob, prog);
   }
 
   // 正面向きスプライトは回転させず、左向き移動時だけ左右ミラー
-  const b = bodySpriteRect();
+  const b = bodySpriteRect(p);
   ctx.save();
-  ctx.translate(penguin.x, penguin.y + bob);
-  if (Math.cos(penguin.angle) < 0) ctx.scale(-1, 1);
-  ctx.drawImage(sprites.idle, -b.w / 2, b.top - penguin.y, b.w, b.h);
+  ctx.translate(p.x, p.y + bob);
+  if (Math.cos(p.angle) < 0) ctx.scale(-1, 1);
+  ctx.drawImage(spriteImg(p, "idle"), -b.w / 2, b.top - p.y, b.w, b.h);
   ctx.restore();
 }
 
-function drawPenguinShapes(bob) {
-  const { x, y, angle } = penguin;
+function drawPenguinShapes(p, bob) {
+  const { x, y, angle } = p;
+  const col = p.v.shape;
 
   ctx.save();
   ctx.translate(x, y + bob);
 
   // tail (behind body)
-  if (penguin.hasTail) {
+  if (p.hasTail) {
     const ta = angle + Math.PI;
-    const wig = Math.sin(penguin.waddle * 1.5) * 0.25;
+    const wig = Math.sin(p.waddle * 1.5) * 0.25;
     ctx.save();
     ctx.rotate(ta + wig);
-    ctx.fillStyle = grab.active ? "#ffb45e" : "#2c3e50";
+    ctx.fillStyle = grab.active && grab.p === p ? "#ffb45e" : col.tail;
     ctx.beginPath();
-    ctx.moveTo(penguin.r - 6, 0);
-    ctx.lineTo(penguin.r + 20, -9);
-    ctx.lineTo(penguin.r + 20, 9);
+    ctx.moveTo(p.r - 6, 0);
+    ctx.lineTo(p.r + 20, -9);
+    ctx.lineTo(p.r + 20, 9);
     ctx.closePath();
     ctx.fill();
     ctx.restore();
   } else {
     // regrowing stub
-    const p = 1 - penguin.tailRegrow / TAIL_REGROW_SEC;
+    const prog = 1 - p.tailRegrow / TAIL_REGROW_SEC;
     ctx.save();
     ctx.rotate(angle + Math.PI);
-    ctx.fillStyle = "#44586c";
+    ctx.fillStyle = col.stub;
     ctx.beginPath();
-    ctx.moveTo(penguin.r - 6, 0);
-    ctx.lineTo(penguin.r - 6 + 26 * p, -9 * p);
-    ctx.lineTo(penguin.r - 6 + 26 * p, 9 * p);
+    ctx.moveTo(p.r - 6, 0);
+    ctx.lineTo(p.r - 6 + 26 * prog, -9 * prog);
+    ctx.lineTo(p.r - 6 + 26 * prog, 9 * prog);
     ctx.closePath();
     ctx.fill();
     ctx.restore();
   }
 
   // body
-  ctx.fillStyle = "#2c3e50";
+  ctx.fillStyle = col.body;
   ctx.beginPath();
-  ctx.ellipse(0, 0, penguin.r * 0.85, penguin.r, 0, 0, Math.PI * 2);
+  ctx.ellipse(0, 0, p.r * 0.85, p.r, 0, 0, Math.PI * 2);
   ctx.fill();
 
   // belly
   ctx.fillStyle = "#f4f9fd";
   ctx.beginPath();
-  ctx.ellipse(Math.cos(angle) * 7, Math.sin(angle) * 7 + 4, penguin.r * 0.55, penguin.r * 0.68, 0, 0, Math.PI * 2);
+  ctx.ellipse(Math.cos(angle) * 7, Math.sin(angle) * 7 + 4, p.r * 0.55, p.r * 0.68, 0, 0, Math.PI * 2);
   ctx.fill();
 
   // flippers
-  const flap = penguin.state === S.HOKAKU ? Math.sin(penguin.waddle * 4) * 0.7 : Math.sin(penguin.waddle) * 0.15;
-  ctx.fillStyle = "#22303e";
+  const flap = p.state === S.HOKAKU ? Math.sin(p.waddle * 4) * 0.7 : Math.sin(p.waddle) * 0.15;
+  ctx.fillStyle = col.flipper;
   for (const side of [-1, 1]) {
     ctx.save();
     ctx.rotate(angle + side * (Math.PI / 2 + flap * side));
     ctx.beginPath();
-    ctx.ellipse(penguin.r * 0.55, 0, 7, 16, 0, 0, Math.PI * 2);
+    ctx.ellipse(p.r * 0.55, 0, 7, 16, 0, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
   }
 
   // head
-  const hx = Math.cos(angle) * penguin.r * 0.72;
-  const hy = Math.sin(angle) * penguin.r * 0.72 - 14;
-  ctx.fillStyle = "#2c3e50";
+  const hx = Math.cos(angle) * p.r * 0.72;
+  const hy = Math.sin(angle) * p.r * 0.72 - 14;
+  ctx.fillStyle = col.body;
   ctx.beginPath();
   ctx.arc(hx, hy, 14, 0, Math.PI * 2);
   ctx.fill();
@@ -610,12 +821,12 @@ function drawPenguinShapes(bob) {
   ctx.restore();
 }
 
-function drawPenguinOverlays(bob) {
-  const { x, y } = penguin;
+function drawPenguinOverlays(p, bob) {
+  const { x, y } = p;
 
   // "!" alert mark (スプライトの頭上に出す)
-  if (penguin.state === S.KEIKAI) {
-    const topY = spritesReady ? bodySpriteRect().top : y - penguin.r - 24;
+  if (p.state === S.KEIKAI) {
+    const topY = spritesReady ? bodySpriteRect(p).top : y - p.r - 24;
     ctx.fillStyle = "#ffd76a";
     ctx.font = "bold 34px sans-serif";
     ctx.textAlign = "center";
@@ -623,8 +834,8 @@ function drawPenguinOverlays(bob) {
   }
 
   // tension gauge while grabbing
-  if (grab.active) {
-    const t = tailPos();
+  if (grab.active && grab.p === p) {
+    const t = tailPos(p);
     const gw = 70, gh = 10;
     const gx = t.x - gw / 2, gy = t.y + 26;
     ctx.fillStyle = "rgba(0,0,0,0.5)";
@@ -632,7 +843,7 @@ function drawPenguinOverlays(bob) {
     ctx.fillStyle = grab.tension > 0.75 ? "#ff6a8a" : "#ffd76a";
     ctx.fillRect(gx, gy, gw * grab.tension, gh);
     // hint arrow: pull opposite to flee direction
-    const fleeA = penguin.angle;
+    const fleeA = p.angle;
     ctx.save();
     ctx.translate(t.x, t.y);
     ctx.rotate(fleeA + Math.PI);
@@ -646,7 +857,30 @@ function drawPenguinOverlays(bob) {
   }
 }
 
+function drawPenguins() {
+  // 手前(下)にいる個体を後から描く簡易デプスソート
+  const sorted = [...penguins].sort((a, b) => a.y - b.y);
+  for (const p of sorted) drawPenguin(p);
+}
+
 function drawEffects() {
+  for (const r of rings) {
+    const t = 1 - r.life / r.max; // 0→1
+    ctx.globalAlpha = clamp(r.life / r.max, 0, 1);
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 3 * (1 - t) + 1;
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, 14 + t * 80, 0, Math.PI * 2);
+    ctx.stroke();
+    // 十字のグリント
+    const len = 30 * (1 - t) + 6;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(r.x - len, r.y); ctx.lineTo(r.x + len, r.y);
+    ctx.moveTo(r.x, r.y - len); ctx.lineTo(r.x, r.y + len);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
   for (const p of particles) {
     ctx.globalAlpha = clamp(p.life, 0, 1);
     ctx.fillStyle = p.color;
@@ -663,6 +897,30 @@ function drawEffects() {
     ctx.fillText(p.text, p.x, p.y);
   }
   ctx.globalAlpha = 1;
+}
+
+function drawLegend() {
+  // 画面隅の点数凡例（常時表示）
+  const items = [VARIANTS.black, VARIANTS.red, VARIANTS.blue, VARIANTS.white];
+  const y = H - 16;
+  let x = 16;
+  ctx.font = "bold 12px sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  for (const v of items) {
+    ctx.fillStyle = v.ui;
+    ctx.beginPath();
+    ctx.arc(x + 5, y, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(234,246,255,0.5)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = "rgba(234,246,255,0.75)";
+    const label = `${v.name}${v.points}`;
+    ctx.fillText(label, x + 14, y + 1);
+    x += 14 + ctx.measureText(label).width + 12;
+  }
+  ctx.textBaseline = "alphabetic";
 }
 
 function drawHUD() {
@@ -690,10 +948,14 @@ function startGame() {
   game.score = 0;
   game.combo = 0;
   grab.active = false;
+  grab.p = null;
   grab.tension = 0;
   particles = [];
   popups = [];
-  resetPenguin();
+  rings = [];
+  penguins = [];
+  spawnPenguin();
+  scheduleSpawn();
   startOverlay.classList.add("hidden");
   endOverlay.classList.add("hidden");
 }
@@ -701,6 +963,7 @@ function startGame() {
 function endGame() {
   game.running = false;
   grab.active = false;
+  grab.p = null;
   pointer.down = false;
   pointer.id = null;
   if (game.score > game.best) {
@@ -730,18 +993,20 @@ function loop(now) {
       endGame();
     }
     updatePointer(dt);
-    updatePenguin(dt);
+    updatePenguins(dt);
+    updateSpawner(dt);
   }
   updateEffects(dt);
 
   drawBackground();
-  drawPenguin();
+  drawPenguins();
   drawEffects();
+  drawLegend();
   if (game.running) drawHUD();
 
   requestAnimationFrame(loop);
 }
-resetPenguin();
+resetPenguins();
 requestAnimationFrame(loop);
 </script>
 </body>

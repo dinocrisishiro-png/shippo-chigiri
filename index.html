@@ -777,25 +777,88 @@ function drawPenguinShapes(p, bob) {
   ctx.fill();
   ctx.restore();
 
-  // eyes
-  ctx.fillStyle = "#fff";
-  const ex = Math.cos(angle + 0.5) * 9, ey = Math.sin(angle + 0.5) * 9;
-  const ex2 = Math.cos(angle - 0.5) * 9, ey2 = Math.sin(angle - 0.5) * 9;
+  // eyes（引っ張られている間は嫌がる顔に差し替え）
+  if (p.state === S.HOKAKU) {
+    drawAnnoyedFace(hx, hy, p.r * 0.95);
+  } else {
+    ctx.fillStyle = "#fff";
+    const ex = Math.cos(angle + 0.5) * 9, ey = Math.sin(angle + 0.5) * 9;
+    const ex2 = Math.cos(angle - 0.5) * 9, ey2 = Math.sin(angle - 0.5) * 9;
+    ctx.beginPath();
+    ctx.arc(hx + ex, hy + ey, 4, 0, Math.PI * 2);
+    ctx.arc(hx + ex2, hy + ey2, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#111";
+    ctx.beginPath();
+    ctx.arc(hx + ex, hy + ey, 2, 0, Math.PI * 2);
+    ctx.arc(hx + ex2, hy + ey2, 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.restore();
+}
+
+// 引っ張られて嫌がっている表情（＞＜の目・食いしばった口・汗・怒りマーク💢）を
+// 現在の座標系の (cx, cy) を顔の中心として描く。faceW は顔のおよその横幅(px)
+function drawAnnoyedFace(cx, cy, faceW) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  const e = faceW * 0.14;    // 目の大きさ
+  const dx = faceW * 0.19;   // 目の左右オフセット
+  const eyeY = -faceW * 0.06;
+  const mouthY = faceW * 0.12;
+
+  // ＞＜ にギュッとつむった目
+  ctx.strokeStyle = "#241a14";
+  ctx.lineWidth = Math.max(2.5, faceW * 0.055);
   ctx.beginPath();
-  ctx.arc(hx + ex, hy + ey, 4, 0, Math.PI * 2);
-  ctx.arc(hx + ex2, hy + ey2, 4, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillStyle = "#111";
+  ctx.moveTo(-dx - e, eyeY - e); ctx.lineTo(-dx + e * 0.5, eyeY); ctx.lineTo(-dx - e, eyeY + e); // 左 ">"
+  ctx.moveTo(dx + e, eyeY - e);  ctx.lineTo(dx - e * 0.5, eyeY);  ctx.lineTo(dx + e, eyeY + e);  // 右 "<"
+  ctx.stroke();
+
+  // 食いしばった口（ギザギザ）
+  const mw = faceW * 0.34, mh = faceW * 0.06, n = 5;
+  ctx.lineWidth = Math.max(2, faceW * 0.045);
   ctx.beginPath();
-  ctx.arc(hx + ex, hy + ey, 2, 0, Math.PI * 2);
-  ctx.arc(hx + ex2, hy + ey2, 2, 0, Math.PI * 2);
+  ctx.moveTo(-mw / 2, mouthY);
+  for (let i = 1; i <= n; i++) {
+    ctx.lineTo(-mw / 2 + mw * (i / n), mouthY + (i % 2 ? mh : -mh));
+  }
+  ctx.stroke();
+
+  // 汗のしずく（右上）
+  const sx = dx + faceW * 0.26, sy = eyeY - faceW * 0.12;
+  ctx.fillStyle = "rgba(130, 200, 255, 0.92)";
+  ctx.beginPath();
+  ctx.moveTo(sx, sy);
+  ctx.quadraticCurveTo(sx + faceW * 0.055, sy + faceW * 0.06, sx, sy + faceW * 0.12);
+  ctx.quadraticCurveTo(sx - faceW * 0.055, sy + faceW * 0.06, sx, sy);
   ctx.fill();
+
+  // 怒りマーク 💢（左上）
+  const ax = -dx - faceW * 0.16, ay = eyeY - faceW * 0.20, a = faceW * 0.08;
+  ctx.strokeStyle = "rgba(232, 64, 64, 0.95)";
+  ctx.lineWidth = Math.max(1.5, faceW * 0.03);
+  ctx.beginPath();
+  ctx.moveTo(ax - a, ay); ctx.lineTo(ax + a, ay);
+  ctx.moveTo(ax, ay - a); ctx.lineTo(ax, ay + a);
+  ctx.moveTo(ax - a * 0.7, ay - a * 0.7); ctx.lineTo(ax + a * 0.7, ay + a * 0.7);
+  ctx.moveTo(ax + a * 0.7, ay - a * 0.7); ctx.lineTo(ax - a * 0.7, ay + a * 0.7);
+  ctx.stroke();
 
   ctx.restore();
 }
 
 function drawPenguinOverlays(p, bob) {
   const { x, y } = p;
+
+  // 引っ張られている間はスプライトの顔に嫌がる表情を重ねる
+  if (p.state === S.HOKAKU && spritesReady) {
+    const b = bodySpriteRect(p);
+    drawAnnoyedFace(x, b.top + bob + b.h * 0.40, b.w * 0.62);
+  }
 
   // "!" alert mark (スプライトの頭上に出す)
   if (p.state === S.KEIKAI) {

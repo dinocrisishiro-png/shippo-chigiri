@@ -1004,6 +1004,7 @@ const audio = {
   ctx: null, master: null, musicGain: null, sfxGain: null,
   enabled: localStorage.getItem(AUDIO_KEY) !== "off",
   musicTimer: null,
+  needsRebuild: false, // interrupted検知後、次のpointerdownで作り直す
 };
 
 function initAudio() {
@@ -1012,7 +1013,7 @@ function initAudio() {
   if (!AC) return;
   audio.ctx = new AC();
   audio.master = audio.ctx.createGain();
-  audio.master.gain.value = audio.enabled ? 1 : 0;
+  audio.master.gain.value = audio.enabled ? 1 : 0; // ミュート状態(localStorage)を復元
   audio.master.connect(audio.ctx.destination);
   audio.musicGain = audio.ctx.createGain();
   audio.musicGain.gain.value = 0.32;
@@ -1020,11 +1021,53 @@ function initAudio() {
   audio.sfxGain = audio.ctx.createGain();
   audio.sfxGain.gain.value = 0.5;
   audio.sfxGain.connect(audio.master);
+  audio.needsRebuild = false;
+  // iOS Safari は画面収録/通話/他アプリ音などの割り込みで state が "interrupted" になる
+  audio.ctx.onstatechange = () => {
+    if (!audio.ctx) return;
+    const st = audio.ctx.state;
+    if (st === "interrupted") {
+      audio.needsRebuild = true;                                  // 次のユーザー操作で作り直す
+    } else if (st === "suspended") {
+      audio.ctx.resume().catch(() => { audio.needsRebuild = true; });
+    }
+  };
 }
+
+// ユーザー操作(ジェスチャ)時：生成・復帰・必要なら作り直し
 function resumeAudio() {
   if (!audio.ctx) initAudio();
-  if (audio.ctx && audio.ctx.state === "suspended") audio.ctx.resume();
+  if (audio.needsRebuild) { rebuildAudio(); return; }
+  if (audio.ctx && (audio.ctx.state === "suspended" || audio.ctx.state === "interrupted")) {
+    audio.ctx.resume().catch(() => { audio.needsRebuild = true; });
+  }
 }
+
+// ジェスチャ以外(可視化/フォーカス)からの軽い復帰。Contextの新規生成はpointerdownに任せる
+function recoverAudio() {
+  if (!audio.ctx || audio.needsRebuild) return;
+  if (audio.ctx.state === "suspended" || audio.ctx.state === "interrupted") {
+    audio.ctx.resume().catch(() => { audio.needsRebuild = true; });
+  }
+}
+
+// AudioContextを破棄→再生成し、Gain/BGM/SEを作り直す（interrupted後の再生破損対策）
+function rebuildAudio() {
+  const wasPlaying = !!audio.musicTimer;
+  stopMusic();
+  screamNextTime = 0;
+  if (audio.ctx) { try { audio.ctx.close(); } catch (e) {} }
+  audio.ctx = null; audio.master = null; audio.musicGain = null; audio.sfxGain = null;
+  audio.needsRebuild = false;
+  initAudio(); // 新Context+Gain構成+statechangeハンドラを再構築（ミュートはaudio.enabledから復元）
+  if (audio.ctx && audio.ctx.state !== "running") audio.ctx.resume().catch(() => {});
+  if (wasPlaying && game.running) startMusic();
+}
+
+// iOSの割り込み(画面収録など)からの自動復帰トリガー
+document.addEventListener("pointerdown", resumeAudio, true);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) recoverAudio(); });
+window.addEventListener("focus", recoverAudio);
 const midiFreq = (n) => 440 * Math.pow(2, (n - 69) / 12);
 
 // BGM: ゆるくてかわいいペンタトニックのループ（16ステップ=8分音符）
